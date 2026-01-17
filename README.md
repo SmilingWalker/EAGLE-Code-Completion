@@ -246,11 +246,74 @@ output=model.tokenizer.decode(output_ids[0])
 
 ## Train
 
+**Note:** Training is supported on single GPU only. Multi-card training is not supported.
+
+### Chat Format Training
+
 ```bash
 cd eagle/traineagle3
-deepspeed main.py --deepspeed_config ds_config.json
+python main.py --basepath [path/to/base/model] --tmpdir [path/to/data] --cpdir [path/to/checkpoints]
 ```
+
 We strongly recommend using [SpecForge](https://github.com/sgl-project/SpecForge) for out-of-the-box training of EAGLE-3 with SGLang.
+
+### FIM Format Training
+
+EAGLE-3 now supports Fill-In-Middle (FIM) format data for code completion tasks.
+
+#### FIM Data Format
+
+FIM data should be in JSON format with the following structure:
+
+```json
+{
+  "prefix": "def hello():\n    ",
+  "middle": "print('hello')",
+  "suffix": "\n    print('world')"
+}
+```
+
+The FIM prompt is formatted as:
+```
+<fim_prefix>{prefix}<fim_middle>{middle}<fim_suffix>{suffix}
+```
+
+#### Training Command
+
+```bash
+cd eagle/traineagle3
+python main.py --basepath [path/to/base/model] --tmpdir [path/to/fim_data] --cpdir [path/to/checkpoints] --data-format fim
+```
+
+#### FIM Special Tokens
+
+The following special tokens are used (treated as regular text):
+- `<fim_prefix>`: Marks the beginning of the prefix
+- `<fim_middle>`: Marks the section to be filled in
+- `<fim_suffix>`: Marks the beginning of the suffix
+
+#### Loss Masking
+
+For FIM format, loss is only computed on the middle section tokens. The prefix and suffix are masked out to focus training on the fill-in-middle task.
+
+#### Sample FIM Dataset
+
+```json
+[
+  {
+    "prefix": "def calculate_sum(a, b):\n    return ",
+    "middle": "return a + b",
+    "suffix": "\n\n# Test\ncalculate_sum(1, 2)  # Expected: 3"
+  },
+  {
+    "prefix": "def process_data(items):\n    results = []\n    for item in items:\n        ",
+    "middle": "results.append(item * 2)\n    return results",
+    "suffix": "\n\n# Test\nprocess_data([1, 2, 3])  # Expected: [2, 4, 6]"
+  }
+]
+```
+
+Save this as `fim_train_data.jsonl` and use it for training.
 
 
 
