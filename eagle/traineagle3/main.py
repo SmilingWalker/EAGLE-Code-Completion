@@ -9,6 +9,9 @@ parser.add_argument('--testpath', type=str,
                     default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json")
 parser.add_argument('--savedir', type=str, default='0')
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
+parser.add_argument('--data-format', type=str, default='chat',
+                    choices=['chat', 'fim'],
+                    help="Data format: 'chat' for conversation data, 'fim' for fill-in-middle data")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 import json
@@ -23,7 +26,8 @@ train_config = {
     "num_workers": 2,
     "max_len": 2048,
     "config_path": "config.json",
-    "gradient_checkpoint": True
+    "gradient_checkpoint": True,
+    "data_format": args.data_format
 }
 
 from safetensors import safe_open
@@ -51,18 +55,104 @@ import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 
 
-
-def build_dataset_rank(
+def build_fim_dataset_rank(
         tokenizer, datapath
-):
-
+    ):
+    """
+    Build dataset from FIM (Fill-In-Middle) format data.
+    
+    Expected JSON format:
+    {
+        "prefix": "def hello():\n    ",
+        "middle": "print('hello')",
+        "suffix": "\n    print('world')"
+    }
+    """
     ds = load_dataset('json', data_files=datapath)
     ds = ds['train']
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
     num_proc = 8
+    
+    # FIM special tokens (treated as regular text for simplicity)
+    FIM_PREFIX = "<fim_prefix>"
+    FIM_MIDDLE = "<fim_middle>"
+    FIM_SUFFIX = "<fim_suffix>"
+    
+    def preprocess_fim_function(examples):
+        new_examples = {
+            "attention_mask": [],
+            "input_ids": [],
+            "loss_mask": []
+        }
+        
+        for i in range(len(examples.get('prefix', []))):
+            prefix = examples['prefix'][i]
+            middle = examples['middle'][i]
+            suffix = examples['suffix'][i]
+            
+            # Format with FIM special tokens
+            fim_prompt = f"{FIM_PREFIX}{prefix}{FIM_MIDDLE}{middle}{FIM_SUFFIX}{suffix}"
+            
+            # Tokenize full FIM prompt
+            input_ids = tokenizer(
+                fim_prompt,
+                return_tensors="pt",
+                add_special_tokens=False,
+            ).input_ids[0]
+            
+            # Tokenize individual parts for loss mask calculation
+            prefix_ids = tokenizer(prefix, add_special_tokens=False).input_ids
+            middle_ids = tokenizer(middle, add_special_tokens=False).input_ids
+            suffix_ids = tokenizer(suffix, add_special_tokens=False).input_ids
+            
+            # filtering out samples which are longer than max_len
+            if len(input_ids) > train_config["max_len"]:
+                continue
+            
+            # Create loss mask: only compute loss on middle section
+            loss_mask = torch.zeros_like(input_ids, dtype=torch.float)
+            
+            # Calculate positions for middle tokens in the full input_ids
+            # The middle section starts after prefix and FIM tokens
+            middle_start = len(prefix_ids) + len(tokenizer(FIM_PREFIX).input_ids) + len(tokenizer(FIM_MIDDLE).input_ids)
+            middle_end = middle_start + len(middle_ids)
+            
+            # Set loss mask to 1 only for middle tokens
+            loss_mask[middle_start:middle_end] = 1.0
+            
+            attention_mask = torch.ones_like(loss_mask)
+            
+            new_examples["input_ids"].append(input_ids[None, :])
+            new_examples["loss_mask"].append(loss_mask[None, :])
+            new_examples["attention_mask"].append(attention_mask[None, :])
+        
+        return new_examples
+    
+    ds1 = ds1.map(
+        preprocess_fim_function,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=original_columns1,
+        load_from_cache_file=False
+    )
+    
+    ds1.set_format(type="torch")
+    return ds1
 
+
+def build_chat_dataset_rank(
+        tokenizer, datapath
+    ):
+ 
+    ds = load_dataset('json', data_files=datapath)
+    ds = ds['train']
+    ds = ds.shuffle(seed=42)
+    ds1 = ds
+    original_columns1 = ds1.column_names
+    num_proc = 8
+ 
     def preprocess_function(examples):
         new_examples = {
             "attention_mask": [],
@@ -80,7 +170,7 @@ def build_dataset_rank(
             if not source:
                 continue
             if roles[source[0]["from"]] != "user":
-                # Skip the first one if it is not from human
+                # Skip first one if it is not from human
                 source = source[1:]
             for j, sentence in enumerate(source):
                 role = roles[sentence["from"]]
@@ -95,45 +185,45 @@ def build_dataset_rank(
                 tokenize=False,
                 add_generation_prompt=False,
             )
-
+ 
             if not tokenizer.pad_token_id:
                 tokenizer.pad_token_id = tokenizer.unk_token_id
-
+ 
             input_ids = tokenizer(
                 conversation,
                 return_tensors="pt",
                 add_special_tokens=False,
             ).input_ids[0]
-            # filtering out the samples which is longer than max_len
+            # filtering out of samples which is longer than max_len
             if len(input_ids) > train_config["max_len"]:
                 continue
             loss_mask = torch.ones_like(input_ids)
             # print(i)
-
+ 
             sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
+ 
             total_len = len(input_ids)
-
+ 
             sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
             turns = conversation.split(sep2)
-
+ 
             turns[1] = turns[0] + sep2 + turns[1]
             turns = turns[1:]
-
+ 
             cur_len = 1
             loss_mask[:cur_len] = 0
             for i, turn in enumerate(turns):
                 if turn == "":
                     break
-                turn_len = len(tokenizer(turn).input_ids)
-
+                turn_len = len(tokenizer(turn).input_ids
+ 
                 parts = turn.split(sep)
                 if len(parts) != 2:
                     break
                 parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
+                # "-2" is hardcoded for Llama tokenizer to make the offset correct.
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
+ 
                 # Ignore the user instructions
                 if i == 0:
                     loss_mask[cur_len: cur_len + instruction_len - 2] = 0
@@ -143,21 +233,21 @@ def build_dataset_rank(
                 if i != 0:
                     cur_len += 3
                 # cur_len+=2
-
+ 
                 # if i != 0 and not tokenizer.legacy:
                 #     # The legacy and non-legacy modes handle special tokens differently
                 #     cur_len -= 1
-
+ 
             loss_mask[cur_len:] = 0
             attention_mask = torch.ones_like(loss_mask)
-
+ 
             # new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
             new_examples["attention_mask"].append(attention_mask[None, :])
-
+ 
         return new_examples
-
+ 
     ds1 = ds1.map(
         preprocess_function,
         batched=True,
@@ -165,27 +255,48 @@ def build_dataset_rank(
         remove_columns=original_columns1,
         load_from_cache_file=False
     )
-
-
+ 
+ 
     ds1.set_format(type="torch")
     return ds1
 
 
-class DataCollatorWithPadding:
+def build_dataset_rank(
+        tokenizer, datapath, data_format='chat'
+    ):
+    """
+    Build dataset from either chat or FIM format based on data_format argument.
+    
+    Args:
+        tokenizer: The tokenizer to use
+        datapath: Path to the dataset file
+        data_format: 'chat' for conversation data, 'fim' for fill-in-middle data
+    
+    Returns:
+        Processed dataset ready for training
+    """
+    if data_format == 'fim':
+        return build_fim_dataset_rank(tokenizer, datapath)
+    else:
+        return build_chat_dataset_rank(tokenizer, datapath)
+ 
 
+ 
+class DataCollatorWithPadding:
+ 
     def paddingtensor(self, intensors, N):
         B, n, S = intensors.shape
         # padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
-
+ 
     def paddingtensor2D(self, intensors, N):
         B, n = intensors.shape
         padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
-
+ 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item['input_ids'].shape[1] for item in features)
         batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
@@ -193,7 +304,7 @@ class DataCollatorWithPadding:
             [self.paddingtensor2D(item['attention_mask'], max_length) for item in features])
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(item['loss_mask'], max_length) for item in features])
-
+ 
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
@@ -203,22 +314,21 @@ class DataCollatorWithPadding:
 
 
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
-traindataset = build_dataset_rank(tokenizer, args.trainpath)
-testdataset = build_dataset_rank(tokenizer, args.testpath)
+traindataset = build_dataset_rank(tokenizer, args.trainpath, args.data_format)
+testdataset = build_dataset_rank(tokenizer, args.testpath, args.data_format)
 
 config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
 model.scandata(args.trainpath, args.basepath)
-
 
 criterion = nn.SmoothL1Loss(reduction="none")
 
 num_epochs = train_config["num_epochs"]
 
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
-                                                     model=model,
-                                                     model_parameters=model.parameters(),
-                                                     )
+                                                      model=model,
+                                                      model_parameters=model.parameters(),
+                                                      )
 
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
@@ -240,7 +350,6 @@ train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=t
                           pin_memory=True,
                           collate_fn=DataCollatorWithPadding())
 
-
 def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
     max_a = -1
     for subdir in os.listdir(directory):
@@ -255,22 +364,20 @@ def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
         return None, 0
     return f"{directory}/state_{max_a}", max_a + 1
 
-
 checkpoint_path, start_epoch = find_max_state_with_file(args.savedir)
 if checkpoint_path:
     print(f"load from {checkpoint_path}")
     model_engine.load_checkpoint(checkpoint_path)
 
 
-
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch+1)
     print(f"Now training epoch {epoch}")
+    print(f"Data format: {args.data_format}")
 
     model.train()
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
-
 
     for batch_idx, data in enumerate(tqdm(train_loader)):
 
@@ -286,7 +393,6 @@ for epoch in range(start_epoch, num_epochs):
         loss = ploss
         model_engine.backward(loss)
 
-
         model_engine.step()
 
         if global_rank == 0:
@@ -299,14 +405,13 @@ for epoch in range(start_epoch, num_epochs):
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
-
     for i in range(len(epoch_acces)):
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
         acc_i = acc_i.item()
         if global_rank == 0:
             wandb.log({f"train/epochacc_{i}": acc_i})
-            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+            print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, Acc: {acc_i:.2f}")
 
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
@@ -334,7 +439,7 @@ for epoch in range(start_epoch, num_epochs):
         acc_i = acc_i.item()
         if global_rank == 0:
             wandb.log({f"test/epochacc_{i}": acc_i})
-            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
+            print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, Acc: {acc_i:.2f}")
 
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
@@ -343,7 +448,7 @@ for epoch in range(start_epoch, num_epochs):
         if global_rank == 0:
             wandb.log({f"test/epochploss_{i}": loss_i})
             print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
-    # clear out the redundance cahce after each step
+    # clear out of redundance cahce after each step
     torch.cuda.empty_cache()
 
     model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
